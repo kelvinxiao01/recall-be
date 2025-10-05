@@ -5,7 +5,7 @@ from typing import Optional
 import datetime
 from livekit import agents
 from livekit.agents import JobContext, WorkerOptions, AgentSession, Agent, RunContext, function_tool, RoomInputOptions
-from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs
+from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs, google
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -378,14 +378,21 @@ async def entrypoint(ctx: JobContext):
             model="nova-3",
             language="en",
         ),
-        llm=openai.LLM(
-            model="gpt-4o-mini",
-            temperature=0.6,
+        # llm=openai.LLM(
+        #     model="gpt-4o-mini",
+        #     temperature=0.6,
+        # ),
+        llm=google.LLM(
+            model="gemini-2.5-flash",
         ),
         tts=cartesia.TTS(
             model="sonic-2",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Professional voice
         ),
+        # tts=cartesia.TTS(
+        #     model="sonic-2",
+        #     voice="5755fb89-cd45-4871-bb79-acdb878c8af6",  # Professional voice
+        # ),
         # tts=elevenlabs.TTS(
         #     voice_id="cNYrMw9glwJZXR8RwbuR",
         #     model="eleven_multilingual_v2"
@@ -404,7 +411,7 @@ async def entrypoint(ctx: JobContext):
 
     # Generate initial greeting
     await session.generate_reply(
-        instructions=f"Greet the caller: 'Thank you for calling {BUSINESS_NAME}, how may I help you today?'"
+        instructions=f"Greet the caller: 'Thank you for calling {BUSINESS_NAME}, how may I assist you today?'"
     )
 
     # Register callback to write to Supabase when call ends
