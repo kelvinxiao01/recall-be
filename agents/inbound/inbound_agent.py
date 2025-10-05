@@ -9,6 +9,7 @@ from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellati
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from supabase import create_client, Client
 
 
 load_dotenv()
@@ -27,6 +28,10 @@ ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 DEFAULT_MEETING_DURATION = int(os.getenv("DEFAULT_MEETING_DURATION", "60"))
+
+# Supabase configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SK")  # Use secret key for backend operations
 
 SYSTEM_INSTRUCTIONS = f"""You are a professional receptionist for {BUSINESS_NAME}.
 
@@ -54,7 +59,7 @@ IMPORTANT CONVERSATION FLOW FOR SCHEDULING:
 2. Once you have the date/time, collect:
    - Caller's name
    - Purpose of meeting
-   - Phone number (if not auto-detected)
+   - DO NOT ask for phone number - it is automatically detected from the call
 3. Use schedule_appointment to book the meeting directly on the calendar
 4. Confirm the appointment details with the caller
 
@@ -68,7 +73,16 @@ class ReceptionistAgent(Agent):
     def __init__(self):
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
         self.caller_phone = None
+        self.caller_name = None
+        self.meeting_date = None
         self._calendar_service = None
+        self.call_start_time = datetime.datetime.now()
+        self.call_notes = []  # Track important events during the call
+
+    def add_note(self, note: str):
+        """Add a note to the call history."""
+        self.call_notes.append(note)
+        logger.info(f"Call note added: {note}")
 
     def _get_calendar_service(self):
         """Initialize and return Google Calendar service."""
@@ -200,7 +214,14 @@ class ReceptionistAgent(Agent):
 
             logger.info(f"Event created: {created_event.get('htmlLink')}")
 
+            # Store caller name and meeting date for call history
+            if not self.caller_name:
+                self.caller_name = caller_name
+            self.meeting_date = start_time.strftime('%Y-%m-%d %I:%M %p')
+            logger.info(f"✓ Meeting date set for call history: {self.meeting_date}")
+
             formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
+            self.add_note(purpose or 'Not specified')
             return f"Perfect! I've scheduled your appointment for {formatted_time}. You should receive a confirmation shortly."
 
         except HttpError as error:
@@ -227,6 +248,13 @@ class ReceptionistAgent(Agent):
         logger.info(f"Preferred date: {preferred_date or 'Not specified'}")
         logger.info(f"Preferred time: {preferred_time or 'Not specified'}")
 
+        # Store caller name for call history
+        if not self.caller_name:
+            self.caller_name = caller_name
+
+        # Add note about the message - just the message content
+        self.add_note(message or 'Meeting request')
+
         # In the future, this would integrate with a scheduling system or database
         response = f"Thank you, {caller_name}. I've recorded your "
 
@@ -242,6 +270,39 @@ class ReceptionistAgent(Agent):
         response += ". Someone from our team will call you back shortly to confirm."
 
         return response
+
+
+async def write_call_history_to_supabase(
+    phone_number: Optional[str],
+    caller_name: Optional[str],
+    meeting_date: Optional[str],
+    notes: list[str]
+):
+    """Write call history to Supabase call_history table."""
+    try:
+        # Initialize Supabase client
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Combine notes into a single string
+        notes_text = "; ".join(notes) if notes else "No specific notes"
+
+        # Prepare data for insertion
+        call_data = {
+            "notes": notes_text,
+            "phone_number": phone_number,
+            "name": caller_name,
+            "meeting_date": meeting_date
+        }
+
+        logger.info(f"Writing call history to Supabase: {call_data}")
+
+        # Insert into call_history table
+        result = supabase.table("call_history").insert(call_data).execute()
+
+        logger.info(f"✓ Call history written successfully: {result}")
+
+    except Exception as e:
+        logger.error(f"Failed to write call history to Supabase: {e}")
 
 
 async def entrypoint(ctx: JobContext):
@@ -318,14 +379,14 @@ async def entrypoint(ctx: JobContext):
             model="gpt-4o-mini",
             temperature=0.6,
         ),
-        # tts=cartesia.TTS(
-        #     model="sonic-2",
-        #     voice="098d5e5f-9ba9-486d-873e-4b1943f20d62",  # Professional voice
-        # ),
-        tts=elevenlabs.TTS(
-            voice_id="cNYrMw9glwJZXR8RwbuR",
-            model="eleven_multilingual_v2"
+        tts=cartesia.TTS(
+            model="sonic-2",
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Professional voice
         ),
+        # tts=elevenlabs.TTS(
+        #     voice_id="cNYrMw9glwJZXR8RwbuR",
+        #     model="eleven_multilingual_v2"
+        # ),
         vad=silero.VAD.load(),
     )
 
@@ -342,6 +403,18 @@ async def entrypoint(ctx: JobContext):
     await session.generate_reply(
         instructions=f"Greet the caller: 'Thank you for calling {BUSINESS_NAME}, how may I help you today?'"
     )
+
+    # Register callback to write to Supabase when call ends
+    @ctx.room.on("participant_disconnected")
+    def on_disconnect(participant):
+        logger.info("Participant disconnected, writing to Supabase...")
+        import asyncio
+        asyncio.create_task(write_call_history_to_supabase(
+            phone_number=receptionist_agent.caller_phone,
+            caller_name=receptionist_agent.caller_name,
+            meeting_date=receptionist_agent.meeting_date,
+            notes=receptionist_agent.call_notes
+        ))
 
 
 if __name__ == "__main__":
