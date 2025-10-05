@@ -3,8 +3,9 @@ import logging
 import os
 from typing import Optional
 from livekit import agents
-from livekit.agents import JobContext, WorkerOptions, AgentSession, Agent, RunContext, function_tool
-from livekit.plugins import deepgram, openai, cartesia, silero
+from livekit.agents import JobContext, WorkerOptions, AgentSession, Agent, RunContext, function_tool, RoomInputOptions
+from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs
+
 
 load_dotenv()
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Your Business")
 BUSINESS_HOURS = os.getenv("BUSINESS_HOURS", "Mon-Fri 9AM-5PM")
 BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+1234567890")
+ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 
 SYSTEM_INSTRUCTIONS = f"""You are a professional receptionist for {BUSINESS_NAME}.
 
@@ -165,9 +167,13 @@ async def entrypoint(ctx: JobContext):
             model="gpt-4o-mini",
             temperature=0.6,
         ),
-        tts=cartesia.TTS(
-            model="sonic-2",
-            voice="098d5e5f-9ba9-486d-873e-4b1943f20d62",  # Professional voice
+        # tts=cartesia.TTS(
+        #     model="sonic-2",
+        #     voice="098d5e5f-9ba9-486d-873e-4b1943f20d62",  # Professional voice
+        # ),
+        tts=elevenlabs.TTS(
+            voice_id="cNYrMw9glwJZXR8RwbuR",
+            model="eleven_multilingual_v2"
         ),
         vad=silero.VAD.load(),
     )
@@ -176,6 +182,9 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         room=ctx.room,
         agent=receptionist_agent,
+        room_input_options=RoomInputOptions(
+            noise_cancellation=noise_cancellation.BVCTelephony(),
+        ),
     )
 
     # Generate initial greeting
