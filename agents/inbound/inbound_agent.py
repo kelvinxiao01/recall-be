@@ -218,7 +218,7 @@ class ReceptionistAgent(Agent):
                 self.caller_name = caller_name
 
             formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
-            self.add_note(f"Scheduled appointment for {caller_name} on {formatted_time}. Purpose: {purpose or 'Not specified'}")
+            self.add_note(purpose or 'Not specified')
             return f"Perfect! I've scheduled your appointment for {formatted_time}. You should receive a confirmation shortly."
 
         except HttpError as error:
@@ -249,13 +249,8 @@ class ReceptionistAgent(Agent):
         if not self.caller_name:
             self.caller_name = caller_name
 
-        # Add note about the message
-        note_details = f"Message from {caller_name}"
-        if message:
-            note_details += f": {message}"
-        if preferred_date or preferred_time:
-            note_details += f" (Preferred: {preferred_date or ''} {preferred_time or ''})"
-        self.add_note(note_details)
+        # Add note about the message - just the message content
+        self.add_note(message or 'Meeting request')
 
         # In the future, this would integrate with a scheduling system or database
         response = f"Thank you, {caller_name}. I've recorded your "
