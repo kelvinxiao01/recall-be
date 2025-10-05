@@ -378,13 +378,13 @@ async def entrypoint(ctx: JobContext):
             model="nova-3",
             language="en",
         ),
-        # llm=openai.LLM(
-        #     model="gpt-4o-mini",
-        #     temperature=0.6,
-        # ),
-        llm=google.LLM(
-            model="gemini-2.5-flash",
+        llm=openai.LLM(
+            model="gpt-4o-mini",
+            temperature=0.6,
         ),
+        # llm=google.LLM(
+        #     model="gemini-2.5-flash",
+        # ),
         tts=cartesia.TTS(
             model="sonic-2",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Professional voice
