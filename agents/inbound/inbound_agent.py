@@ -59,7 +59,7 @@ IMPORTANT CONVERSATION FLOW FOR SCHEDULING:
 2. Once you have the date/time, collect:
    - Caller's name
    - Purpose of meeting
-   - Phone number (if not auto-detected)
+   - DO NOT ask for phone number - it is automatically detected from the call
 3. Use schedule_appointment to book the meeting directly on the calendar
 4. Confirm the appointment details with the caller
 
@@ -74,6 +74,7 @@ class ReceptionistAgent(Agent):
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
         self.caller_phone = None
         self.caller_name = None
+        self.meeting_date = None
         self._calendar_service = None
         self.call_start_time = datetime.datetime.now()
         self.call_notes = []  # Track important events during the call
@@ -213,9 +214,11 @@ class ReceptionistAgent(Agent):
 
             logger.info(f"Event created: {created_event.get('htmlLink')}")
 
-            # Store caller name for call history
+            # Store caller name and meeting date for call history
             if not self.caller_name:
                 self.caller_name = caller_name
+            self.meeting_date = start_time.strftime('%Y-%m-%d %I:%M %p')
+            logger.info(f"✓ Meeting date set for call history: {self.meeting_date}")
 
             formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
             self.add_note(purpose or 'Not specified')
@@ -272,6 +275,7 @@ class ReceptionistAgent(Agent):
 async def write_call_history_to_supabase(
     phone_number: Optional[str],
     caller_name: Optional[str],
+    meeting_date: Optional[str],
     notes: list[str]
 ):
     """Write call history to Supabase call_history table."""
@@ -286,7 +290,8 @@ async def write_call_history_to_supabase(
         call_data = {
             "notes": notes_text,
             "phone_number": phone_number,
-            "name": caller_name
+            "name": caller_name,
+            "meeting_date": meeting_date
         }
 
         logger.info(f"Writing call history to Supabase: {call_data}")
@@ -407,6 +412,7 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(write_call_history_to_supabase(
             phone_number=receptionist_agent.caller_phone,
             caller_name=receptionist_agent.caller_name,
+            meeting_date=receptionist_agent.meeting_date,
             notes=receptionist_agent.call_notes
         ))
 
