@@ -6,9 +6,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "livekit>=1.0.13",
-    "livekit-agents>=1.2.14",
+    "livekit-agents[elevenlabs]~=1.2",
     "livekit-plugins-cartesia>=1.2.14",
     "livekit-plugins-deepgram>=1.2.14",
+    "livekit-plugins-noise-cancellation~=0.2",
     "livekit-plugins-openai>=1.2.14",
     "livekit-plugins-silero>=1.2.14",
     "python-dotenv>=1.1.1",
