@@ -210,6 +210,15 @@ class OutboundReminderAgent(Agent):
         """Call this when customer confirms they will attend the meeting"""
         logger.info("Customer confirmed they will attend the meeting")
         self.call_completed = True
+        self.add_note("Confirmed attendance for original appointment")
+
+        # Write to Supabase before ending call
+        await write_call_history_to_supabase(
+            phone_number=self.customer_phone,
+            caller_name=self.customer_name,
+            meeting_date=self.meeting_date,  # Keep original meeting date
+            notes=self.call_notes
+        )
 
         # End the call after confirmation
         await ctx.wait_for_playout()
@@ -278,6 +287,14 @@ class OutboundReminderAgent(Agent):
             formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
             self.add_note(f"Rescheduled from {self.meeting_date} to {formatted_time}. Purpose: {meeting_purpose}")
 
+            # Write to Supabase with new meeting date
+            await write_call_history_to_supabase(
+                phone_number=self.customer_phone,
+                caller_name=self.customer_name,
+                meeting_date=self.new_meeting_date,  # Use new rescheduled date
+                notes=self.call_notes
+            )
+
             return f"Perfect! I've rescheduled your appointment for {formatted_time}. You should receive a confirmation shortly. Is there anything else I can help you with?"
 
         except HttpError as error:
@@ -293,6 +310,15 @@ class OutboundReminderAgent(Agent):
         logger.info("Voicemail detected by agent - hanging up immediately")
         self.voicemail_detected = True
         self.call_completed = True
+        self.add_note("Voicemail detected - no answer")
+
+        # Write to Supabase before ending call
+        await write_call_history_to_supabase(
+            phone_number=self.customer_phone,
+            caller_name=self.customer_name,
+            meeting_date=None,  # No new meeting date for voicemail
+            notes=self.call_notes
+        )
 
         # Hang up immediately without leaving any message
         await self.hangup()
@@ -304,6 +330,16 @@ class OutboundReminderAgent(Agent):
         """Call this when the conversation is complete and customer is informed"""
         logger.info("Call completed successfully")
         self.call_completed = True
+        self.add_note("Call completed successfully")
+
+        # Write to Supabase before ending call
+        # Use new_meeting_date if rescheduled, otherwise None
+        await write_call_history_to_supabase(
+            phone_number=self.customer_phone,
+            caller_name=self.customer_name,
+            meeting_date=self.new_meeting_date,  # Will be None if not rescheduled
+            notes=self.call_notes
+        )
 
         # Wait for final message to play out, then hang up
         await ctx.wait_for_playout()
@@ -506,17 +542,6 @@ async def entrypoint(ctx: JobContext):
             logger.info("Customer did not answer within 60 seconds - ending call")
             ctx.shutdown()
             return
-
-        # Register callback to write to Supabase when call ends
-        @ctx.room.on("participant_disconnected")
-        def on_disconnect(participant):
-            logger.info("Participant disconnected, writing to Supabase...")
-            asyncio.create_task(write_call_history_to_supabase(
-                phone_number=agent.customer_phone,
-                caller_name=agent.customer_name,
-                meeting_date=agent.new_meeting_date,  # Use new meeting date if rescheduled
-                notes=agent.call_notes
-            ))
 
     except api.TwirpError as e:
         logger.error(f"🚨 TWIRP ERROR - SIP participant creation failed!")
