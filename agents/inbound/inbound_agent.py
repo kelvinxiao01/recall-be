@@ -2,9 +2,13 @@ from dotenv import load_dotenv
 import logging
 import os
 from typing import Optional
+import datetime
 from livekit import agents
 from livekit.agents import JobContext, WorkerOptions, AgentSession, Agent, RunContext, function_tool, RoomInputOptions
 from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 load_dotenv()
@@ -19,7 +23,15 @@ BUSINESS_HOURS = os.getenv("BUSINESS_HOURS", "Mon-Fri 9AM-5PM")
 BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+1234567890")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 
+# Google Calendar configuration
+CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+DEFAULT_MEETING_DURATION = int(os.getenv("DEFAULT_MEETING_DURATION", "60"))
+
 SYSTEM_INSTRUCTIONS = f"""You are a professional receptionist for {BUSINESS_NAME}.
+
+IMPORTANT: Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')} ({datetime.datetime.now().strftime('%A, %B %d, %Y')}).
+When scheduling appointments, always use the year 2025 unless the caller explicitly specifies a different year.
 
 Your role is to:
 - Answer calls professionally and courteously
@@ -35,14 +47,18 @@ Always be:
 - Patient with caller questions
 - Helpful within your capabilities
 
-IMPORTANT CONVERSATION FLOW:
-1. When callers want to schedule a meeting, collect their information:
-   - Name
-   - Phone number (if not auto-detected)
-   - Preferred date/time
+IMPORTANT CONVERSATION FLOW FOR SCHEDULING:
+1. When callers want to schedule a meeting:
+   - Ask for their preferred date and time
+   - Optionally use get_available_slots to check if a specific date is free
+2. Once you have the date/time, collect:
+   - Caller's name
    - Purpose of meeting
-2. Use take_message to record their information
-3. Inform them that someone will call them back to confirm the appointment
+   - Phone number (if not auto-detected)
+3. Use schedule_appointment to book the meeting directly on the calendar
+4. Confirm the appointment details with the caller
+
+For general messages (NOT scheduling): Use take_message only for non-scheduling inquiries.
 
 Start each call by greeting the caller: "Thank you for calling {BUSINESS_NAME}, how may I help you today?"
 """
@@ -52,12 +68,147 @@ class ReceptionistAgent(Agent):
     def __init__(self):
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
         self.caller_phone = None
+        self._calendar_service = None
+
+    def _get_calendar_service(self):
+        """Initialize and return Google Calendar service."""
+        if self._calendar_service is None:
+            credentials = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDENTIALS_FILE,
+                scopes=['https://www.googleapis.com/auth/calendar']
+            )
+            self._calendar_service = build('calendar', 'v3', credentials=credentials)
+        return self._calendar_service
 
     @function_tool()
     async def get_business_hours(self, ctx: RunContext) -> str:
         """Get the business hours and availability information."""
         logger.info("Caller requested business hours")
         return f"Our business hours are {BUSINESS_HOURS}. We're happy to schedule a meeting during these times."
+
+    @function_tool()
+    async def get_available_slots(
+        self,
+        ctx: RunContext,
+        date: str
+    ) -> str:
+        """Check available time slots for a specific date. Date should be in format YYYY-MM-DD."""
+        logger.info(f"Checking availability for {date}")
+
+        try:
+            service = self._get_calendar_service()
+
+            # Parse the date and create time range for the day
+            target_date = datetime.datetime.fromisoformat(date)
+            time_min = target_date.replace(hour=0, minute=0, second=0).isoformat() + 'Z'
+            time_max = target_date.replace(hour=23, minute=59, second=59).isoformat() + 'Z'
+
+            # Fetch events for the day
+            events_result = service.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+
+            events = events_result.get('items', [])
+
+            if not events:
+                return f"The calendar is completely free on {date}. What time would work best for you?"
+
+            # Build response with busy times
+            response = f"On {date}, the following times are already booked:\n"
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+
+                # Parse and format times
+                start_time = datetime.datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_time = datetime.datetime.fromisoformat(end.replace('Z', '+00:00'))
+
+                response += f"- {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}\n"
+
+            response += "\nWhat time would you prefer for your appointment?"
+            return response
+
+        except HttpError as error:
+            logger.error(f"Calendar API error: {error}")
+            return "I'm having trouble accessing the calendar right now. Let me take your preferred time and we'll confirm availability shortly."
+        except Exception as e:
+            logger.error(f"Error checking availability: {e}")
+            return "I'm having trouble checking availability. What time works best for you and we'll confirm it?"
+
+    @function_tool()
+    async def schedule_appointment(
+        self,
+        ctx: RunContext,
+        caller_name: str,
+        date_time: str,
+        purpose: Optional[str] = None,
+        phone_number: Optional[str] = None
+    ) -> str:
+        """
+        Schedule an appointment on the calendar.
+
+        Args:
+            caller_name: Name of the person scheduling
+            date_time: Date and time in ISO format (YYYY-MM-DDTHH:MM:SS) or parseable format
+            purpose: Purpose of the meeting
+            phone_number: Contact phone number
+        """
+        logger.info(f"Scheduling appointment for {caller_name} at {date_time}")
+
+        try:
+            service = self._get_calendar_service()
+
+            # Parse the start time
+            start_time = datetime.datetime.fromisoformat(date_time)
+            end_time = start_time + datetime.timedelta(minutes=DEFAULT_MEETING_DURATION)
+
+            # Use caller_phone if phone_number not provided
+            contact_phone = phone_number or self.caller_phone
+
+            # Create event
+            event = {
+                'summary': f'Meeting with {caller_name}',
+                'description': f'Purpose: {purpose or "Not specified"}\nPhone: {contact_phone or "Not provided"}',
+                'start': {
+                    'dateTime': start_time.isoformat(),
+                    'timeZone': 'America/New_York',
+                },
+                'end': {
+                    'dateTime': end_time.isoformat(),
+                    'timeZone': 'America/New_York',
+                },
+                'attendees': [
+                    {'email': caller_name if '@' in caller_name else None}
+                ] if '@' in caller_name else [],
+                'reminders': {
+                    'useDefault': False,
+                    'overrides': [
+                        {'method': 'email', 'minutes': 24 * 60},
+                        {'method': 'popup', 'minutes': 30},
+                    ],
+                },
+            }
+
+            created_event = service.events().insert(
+                calendarId=CALENDAR_ID,
+                body=event
+            ).execute()
+
+            logger.info(f"Event created: {created_event.get('htmlLink')}")
+
+            formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
+            return f"Perfect! I've scheduled your appointment for {formatted_time}. You should receive a confirmation shortly."
+
+        except HttpError as error:
+            logger.error(f"Calendar API error: {error}")
+            return f"I've noted your request for {date_time}, but I'm having trouble accessing the calendar. Someone will call you back to confirm."
+        except Exception as e:
+            logger.error(f"Error scheduling appointment: {e}")
+            return f"I've recorded your appointment request. Someone will call you back to confirm the details."
 
     @function_tool()
     async def take_message(

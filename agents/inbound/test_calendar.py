@@ -28,7 +28,7 @@ def main():
         # Load credentials from the service account key file
         credentials = service_account.Credentials.from_service_account_file(
             GOOGLE_CREDENTIALS_FILE,
-            scopes=['https://www.googleapis.com/auth/calendar.readonly'] # Use readonly scope for testing
+            scopes=['https://www.googleapis.com/auth/calendar'] # Full calendar access for creating events
         )
 
         # Build the service object for the Calendar API
@@ -58,7 +58,7 @@ def main():
             print(f"{start} - {event['summary']}")
 
 
-        start_time = "2025-11-04T22:00:00-04:00"
+        start_time = "2025-10-10T23:00:00-04:00"
         start_time = datetime.datetime.fromisoformat(start_time)
         purpose = "test apiiiii"
         caller_name = "moddy"
@@ -66,7 +66,7 @@ def main():
             
         event = {
             'summary': f'Meeting with {caller_name}',
-            'description': f'Purpose: {purpose}\nPhone: {555-555-3433}',
+            'description': f'Purpose: {purpose}\nPhone: {5555553433}',
             'start': {
                 'dateTime': start_time.isoformat(),
                 'timeZone': 'America/New_York',
