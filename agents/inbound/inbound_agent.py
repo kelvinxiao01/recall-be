@@ -5,7 +5,7 @@ from typing import Optional
 import datetime
 from livekit import agents
 from livekit.agents import JobContext, WorkerOptions, AgentSession, Agent, RunContext, function_tool, RoomInputOptions
-from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs
+from livekit.plugins import deepgram, openai, cartesia, silero, noise_cancellation, elevenlabs, google
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -19,9 +19,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Business configuration
-BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Your Business")
+BUSINESS_NAME = os.getenv("BUSINESS_NAME", "John Doe Legal")
 BUSINESS_HOURS = os.getenv("BUSINESS_HOURS", "Mon-Fri 9AM-5PM")
-BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+1234567890")
+BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+19297173949")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 
 # Google Calendar configuration
@@ -33,39 +33,42 @@ DEFAULT_MEETING_DURATION = int(os.getenv("DEFAULT_MEETING_DURATION", "60"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SK")  # Use secret key for backend operations
 
-SYSTEM_INSTRUCTIONS = f"""You are a professional receptionist for {BUSINESS_NAME}.
+SYSTEM_INSTRUCTIONS = f"""You are a professional legal receptionist for {BUSINESS_NAME}.
 
 IMPORTANT: Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')} ({datetime.datetime.now().strftime('%A, %B %d, %Y')}).
 When scheduling appointments, always use the year 2025 unless the caller explicitly specifies a different year.
 
 Your role is to:
-- Answer calls professionally and courteously
-- Greet callers with the business name
-- Help with meeting scheduling requests
-- Provide business information like hours ({BUSINESS_HOURS}) and phone number ({BUSINESS_PHONE})
-- Take messages for staff members
-- Answer basic questions about the business
+- Answer calls professionally with appropriate legal office formality
+- Greet callers with the firm name
+- Schedule client consultations and appointments
+- Provide office information like hours ({BUSINESS_HOURS}) and phone number ({BUSINESS_PHONE})
+- Take messages for attorneys and staff members
+- Handle inquiries about case status, documentation, and general legal services
+
+IMPORTANT: You cannot provide legal advice. If callers ask legal questions, politely explain that you'll need to have an attorney call them back, or offer to schedule a consultation.
 
 Always be:
-- Professional and empathetic
-- Clear and concise
-- Patient with caller questions
-- Helpful within your capabilities
+- Professional, courteous, and discreet
+- Respectful of client confidentiality
+- Clear and precise in communication
+- Patient and empathetic with caller concerns
+- Helpful within your administrative capabilities
 
-IMPORTANT CONVERSATION FLOW FOR SCHEDULING:
-1. When callers want to schedule a meeting:
+IMPORTANT CONVERSATION FLOW FOR SCHEDULING CONSULTATIONS:
+1. When callers want to schedule a consultation or appointment:
    - Ask for their preferred date and time
    - Optionally use get_available_slots to check if a specific date is free
 2. Once you have the date/time, collect:
-   - Caller's name
-   - Purpose of meeting
+   - Caller's full name
+   - Nature of legal matter or consultation purpose
    - DO NOT ask for phone number - it is automatically detected from the call
-3. Use schedule_appointment to book the meeting directly on the calendar
+3. Use schedule_appointment to book the consultation directly on the calendar
 4. Confirm the appointment details with the caller
 
-For general messages (NOT scheduling): Use take_message only for non-scheduling inquiries.
+For general messages (NOT scheduling): Use take_message only for non-scheduling inquiries such as case status questions, document requests, or callback requests.
 
-Start each call by greeting the caller: "Thank you for calling {BUSINESS_NAME}, how may I help you today?"
+Start each call by greeting the caller: "Thank you for calling {BUSINESS_NAME}, how may I assist you today?"
 """
 
 
@@ -375,14 +378,21 @@ async def entrypoint(ctx: JobContext):
             model="nova-3",
             language="en",
         ),
-        llm=openai.LLM(
-            model="gpt-4o-mini",
-            temperature=0.6,
+        # llm=openai.LLM(
+        #     model="gpt-4o-mini",
+        #     temperature=0.6,
+        # ),
+        llm=google.LLM(
+            model="gemini-2.5-flash",
         ),
         tts=cartesia.TTS(
             model="sonic-2",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Professional voice
         ),
+        # tts=cartesia.TTS(
+        #     model="sonic-2",
+        #     voice="5755fb89-cd45-4871-bb79-acdb878c8af6",  # Professional voice
+        # ),
         # tts=elevenlabs.TTS(
         #     voice_id="cNYrMw9glwJZXR8RwbuR",
         #     model="eleven_multilingual_v2"
@@ -401,7 +411,7 @@ async def entrypoint(ctx: JobContext):
 
     # Generate initial greeting
     await session.generate_reply(
-        instructions=f"Greet the caller: 'Thank you for calling {BUSINESS_NAME}, how may I help you today?'"
+        instructions=f"Greet the caller: 'Thank you for calling {BUSINESS_NAME}, how may I assist you today?'"
     )
 
     # Register callback to write to Supabase when call ends
