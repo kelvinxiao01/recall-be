@@ -220,7 +220,7 @@ class ReceptionistAgent(Agent):
             # Store caller name and meeting date for call history
             if not self.caller_name:
                 self.caller_name = caller_name
-            self.meeting_date = start_time.strftime('%Y-%m-%d %I:%M %p')
+            self.meeting_date = start_time.isoformat()
             logger.info(f"✓ Meeting date set for call history: {self.meeting_date}")
 
             formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')

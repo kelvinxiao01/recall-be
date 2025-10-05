@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import json
+import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
@@ -19,7 +20,11 @@ from livekit.agents import (
     cli,
     RoomInputOptions
 )
-from livekit.plugins import deepgram, openai, cartesia, silero
+from livekit.plugins import deepgram, openai, cartesia, silero, google
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -28,18 +33,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outbound-reminder-agent")
 
 # Business configuration
-BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Your Business")
-BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+1234567890")
+BUSINESS_NAME = os.getenv("BUSINESS_NAME", "John Doe Legal")
+BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "+19297173949")
+BUSINESS_HOURS = os.getenv("BUSINESS_HOURS", "Mon-Fri 9AM-5PM")
 outbound_trunk_id = os.getenv("OUTBOUND_SIP_TRUNK_ID")
 twilio_caller_id = os.getenv("TWILIO_CALLER_ID")
 
-OUTBOUND_SYSTEM_INSTRUCTIONS = f"""You are calling customers on behalf of {BUSINESS_NAME} to remind them about upcoming meetings.
+# Google Calendar configuration
+CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+DEFAULT_MEETING_DURATION = int(os.getenv("DEFAULT_MEETING_DURATION", "60"))
+
+# Supabase configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SK")  # Use secret key for backend operations
+
+OUTBOUND_SYSTEM_INSTRUCTIONS = f"""You are calling customers on behalf of {BUSINESS_NAME} to follow up on missed appointments.
+
+IMPORTANT: Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')} ({datetime.datetime.now().strftime('%A, %B %d, %Y')}).
+When scheduling appointments, always use the year 2025 unless the caller explicitly specifies a different year.
 
 Your role is to:
-- Politely remind customers about their scheduled meeting
-- Confirm meeting details if they ask
-- Handle rescheduling requests
-- Answer questions about the meeting
+- Politely inform customers they missed their scheduled appointment
+- Apologize for any inconvenience and offer to reschedule
+- Help them find a new appointment time
+- Answer questions about the appointment
 - IMMEDIATELY detect if you've reached voicemail and hang up
 
 CRITICAL VOICEMAIL DETECTION - CALL detected_answering_machine() IMMEDIATELY IF YOU HEAR:
@@ -56,15 +74,17 @@ IMPORTANT CONVERSATION BEHAVIOR:
 - WAIT for the other party to speak first before saying anything
 - Listen carefully to determine if it's a real person or voicemail
 - If you detect voicemail phrases, IMMEDIATELY call detected_answering_machine() - DO NOT CONTINUE TALKING
-- If it's a real person, then identify yourself: "Hello, this is {BUSINESS_NAME} calling about your upcoming meeting"
-- State the purpose clearly and provide meeting details
-- If customer confirms they'll attend, use confirm_meeting() and end the call
-- If they want to reschedule, use reschedule_request() and inform them someone will call back
+- If it's a real person, then identify yourself: "Hello, this is {BUSINESS_NAME} calling about your missed appointment"
+- State the purpose clearly and provide original meeting details
+- If customer wants to reschedule, collect their preferred date/time and use schedule_appointment() to book it on the calendar
+- You can optionally use get_available_slots() to check availability for a specific date
+- DO NOT ask for phone number - it is automatically detected from the call
 
-Keep conversations SHORT and to the point. Most calls should be under 1 minute.
+Keep conversations SHORT and to the point. Most calls should be under 2 minutes.
 
 Business Info:
 - Phone: {BUSINESS_PHONE}
+- Hours: {BUSINESS_HOURS}
 """
 
 
@@ -74,6 +94,8 @@ class OutboundReminderAgent(Agent):
         self.meeting_data = meeting_data
         self.call_completed = False
         self.voicemail_detected = False
+        self._calendar_service = None
+        self.call_notes = []  # Track important events during the call
 
         # Parse meeting information from metadata
         self.customer_phone = meeting_data.get('phone_number', 'Unknown')
@@ -81,11 +103,27 @@ class OutboundReminderAgent(Agent):
         self.meeting_date = meeting_data.get('meeting_date', 'your scheduled time')
         self.meeting_time = meeting_data.get('meeting_time', '')
         self.meeting_purpose = meeting_data.get('meeting_purpose', 'your meeting')
+        self.new_meeting_date = None  # Will store rescheduled meeting time
 
         # Keep reference to participant for call management
         self.participant: rtc.RemoteParticipant | None = None
 
         logger.info(f"OutboundReminderAgent initialized for {self.customer_phone}")
+
+    def add_note(self, note: str):
+        """Add a note to the call history."""
+        self.call_notes.append(note)
+        logger.info(f"Call note added: {note}")
+
+    def _get_calendar_service(self):
+        """Initialize and return Google Calendar service."""
+        if self._calendar_service is None:
+            credentials = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDENTIALS_FILE,
+                scopes=['https://www.googleapis.com/auth/calendar']
+            )
+            self._calendar_service = build('calendar', 'v3', credentials=credentials)
+        return self._calendar_service
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
@@ -101,10 +139,10 @@ class OutboundReminderAgent(Agent):
 
     @function_tool()
     async def get_meeting_details(self, ctx: RunContext) -> str:
-        """Get the meeting details to share with the customer if they ask"""
+        """Get the original missed meeting details to share with the customer if they ask"""
         logger.info("Customer requested meeting details")
 
-        details = f"Your meeting is scheduled"
+        details = f"Your original meeting was scheduled"
         if self.meeting_date:
             details += f" for {self.meeting_date}"
         if self.meeting_time:
@@ -113,6 +151,59 @@ class OutboundReminderAgent(Agent):
             details += f" regarding {self.meeting_purpose}"
 
         return details
+
+    @function_tool()
+    async def get_available_slots(
+        self,
+        ctx: RunContext,
+        date: str
+    ) -> str:
+        """Check available time slots for a specific date. Date should be in format YYYY-MM-DD."""
+        logger.info(f"Checking availability for {date}")
+
+        try:
+            service = self._get_calendar_service()
+
+            # Parse the date and create time range for the day
+            target_date = datetime.datetime.fromisoformat(date)
+            time_min = target_date.replace(hour=0, minute=0, second=0).isoformat() + 'Z'
+            time_max = target_date.replace(hour=23, minute=59, second=59).isoformat() + 'Z'
+
+            # Fetch events for the day
+            events_result = service.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+
+            events = events_result.get('items', [])
+
+            if not events:
+                return f"The calendar is completely free on {date}. What time would work best for you?"
+
+            # Build response with busy times
+            response = f"On {date}, the following times are already booked:\n"
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+
+                # Parse and format times
+                start_time = datetime.datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_time = datetime.datetime.fromisoformat(end.replace('Z', '+00:00'))
+
+                response += f"- {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}\n"
+
+            response += "\nWhat time would you prefer for your appointment?"
+            return response
+
+        except HttpError as error:
+            logger.error(f"Calendar API error: {error}")
+            return "I'm having trouble accessing the calendar right now. Let me take your preferred time and we'll confirm availability shortly."
+        except Exception as e:
+            logger.error(f"Error checking availability: {e}")
+            return "I'm having trouble checking availability. What time works best for you and we'll confirm it?"
 
     @function_tool()
     async def confirm_meeting(self, ctx: RunContext) -> str:
@@ -127,16 +218,74 @@ class OutboundReminderAgent(Agent):
         return "Great! We look forward to seeing you. Thank you!"
 
     @function_tool()
-    async def reschedule_request(self, ctx: RunContext, reason: Optional[str] = None) -> str:
-        """Call this when customer wants to reschedule the meeting"""
-        logger.info(f"Customer requested to reschedule. Reason: {reason or 'Not provided'}")
-        self.call_completed = True
+    async def schedule_appointment(
+        self,
+        ctx: RunContext,
+        date_time: str,
+        purpose: Optional[str] = None
+    ) -> str:
+        """
+        Schedule a new appointment on the calendar to replace the missed one.
 
-        # End the call after acknowledging reschedule request
-        await ctx.wait_for_playout()
-        await self.hangup()
+        Args:
+            date_time: Date and time in ISO format (YYYY-MM-DDTHH:MM:SS) or parseable format
+            purpose: Purpose of the meeting (optional, will use original purpose if not provided)
+        """
+        logger.info(f"Rescheduling appointment for {self.customer_name} at {date_time}")
 
-        return "No problem, I understand. Someone from our team will call you back to reschedule. Thank you!"
+        try:
+            service = self._get_calendar_service()
+
+            # Parse the start time
+            start_time = datetime.datetime.fromisoformat(date_time)
+            end_time = start_time + datetime.timedelta(minutes=DEFAULT_MEETING_DURATION)
+
+            # Use original purpose if not provided
+            meeting_purpose = purpose or self.meeting_purpose
+
+            # Create event
+            event = {
+                'summary': f'Meeting with {self.customer_name}',
+                'description': f'Purpose: {meeting_purpose}\nPhone: {self.customer_phone}\nRescheduled from: {self.meeting_date}',
+                'start': {
+                    'dateTime': start_time.isoformat(),
+                    'timeZone': 'America/New_York',
+                },
+                'end': {
+                    'dateTime': end_time.isoformat(),
+                    'timeZone': 'America/New_York',
+                },
+                'reminders': {
+                    'useDefault': False,
+                    'overrides': [
+                        {'method': 'email', 'minutes': 24 * 60},
+                        {'method': 'popup', 'minutes': 30},
+                    ],
+                },
+            }
+
+            created_event = service.events().insert(
+                calendarId=CALENDAR_ID,
+                body=event
+            ).execute()
+
+            logger.info(f"Event created: {created_event.get('htmlLink')}")
+
+            # Store new meeting date for call history (as ISO timestamp)
+            self.new_meeting_date = start_time.isoformat()
+            logger.info(f"✓ New meeting date set for call history: {self.new_meeting_date}")
+
+            formatted_time = start_time.strftime('%A, %B %d at %I:%M %p')
+            self.add_note(f"Rescheduled from {self.meeting_date} to {formatted_time}. Purpose: {meeting_purpose}")
+
+            return f"Perfect! I've rescheduled your appointment for {formatted_time}. You should receive a confirmation shortly. Is there anything else I can help you with?"
+
+        except HttpError as error:
+            logger.error(f"Calendar API error: {error}")
+            return f"I've noted your preferred time of {date_time}, but I'm having trouble accessing the calendar. Someone will call you back to confirm the rescheduled appointment."
+        except Exception as e:
+            logger.error(f"Error scheduling appointment: {e}")
+            return f"I've recorded your rescheduling request. Someone will call you back to confirm the new appointment details."
 
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext) -> str:
@@ -161,6 +310,39 @@ class OutboundReminderAgent(Agent):
         await self.hangup()
 
         return "Thank you! Have a great day!"
+
+
+async def write_call_history_to_supabase(
+    phone_number: Optional[str],
+    caller_name: Optional[str],
+    meeting_date: Optional[str],
+    notes: list[str]
+):
+    """Write call history to Supabase call_history table."""
+    try:
+        # Initialize Supabase client
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Combine notes into a single string
+        notes_text = "; ".join(notes) if notes else "No specific notes"
+
+        # Prepare data for insertion
+        call_data = {
+            "notes": notes_text,
+            "phone_number": phone_number,
+            "name": caller_name,
+            "meeting_date": meeting_date
+        }
+
+        logger.info(f"Writing call history to Supabase: {call_data}")
+
+        # Insert into call_history table
+        result = supabase.table("call_history").insert(call_data).execute()
+
+        logger.info(f"✓ Call history written successfully: {result}")
+
+    except Exception as e:
+        logger.error(f"Failed to write call history to Supabase: {e}")
 
 
 async def entrypoint(ctx: JobContext):
@@ -217,13 +399,16 @@ async def entrypoint(ctx: JobContext):
             model="nova-3",
             language="en",
         ),
-        llm=openai.LLM(
-            model="gpt-4o-mini",
-            temperature=0.3,  # Lower temperature for more consistent responses
+        # llm=openai.LLM(
+        #     model="gpt-4o-mini",
+        #     temperature=0.3,  # Lower temperature for more consistent responses
+        # ),
+        llm=google.LLM(
+            model="gemini-2.5-flash",
         ),
         tts=cartesia.TTS(
             model="sonic-2",
-            voice="098d5e5f-9ba9-486d-873e-4b1943f20d62",  # Professional voice
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",  # Professional voice
         ),
         vad=silero.VAD.load(),
     )
@@ -321,6 +506,17 @@ async def entrypoint(ctx: JobContext):
             logger.info("Customer did not answer within 60 seconds - ending call")
             ctx.shutdown()
             return
+
+        # Register callback to write to Supabase when call ends
+        @ctx.room.on("participant_disconnected")
+        def on_disconnect(participant):
+            logger.info("Participant disconnected, writing to Supabase...")
+            asyncio.create_task(write_call_history_to_supabase(
+                phone_number=agent.customer_phone,
+                caller_name=agent.customer_name,
+                meeting_date=agent.new_meeting_date,  # Use new meeting date if rescheduled
+                notes=agent.call_notes
+            ))
 
     except api.TwirpError as e:
         logger.error(f"🚨 TWIRP ERROR - SIP participant creation failed!")
